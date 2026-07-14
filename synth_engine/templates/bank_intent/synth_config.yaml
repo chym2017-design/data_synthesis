@@ -1,0 +1,47 @@
+round_distribution:
+  single_intent:
+  - - 1
+    - 0.3
+  - - 2
+    - 0.3
+  - - 3
+    - 0.3
+  - - 4
+    - 0.1
+  multi_intent:
+  - - 2
+    - 0.25
+  - - 3
+    - 0.5
+  - - 4
+    - 0.1
+  - - 5
+    - 0.1
+  - - 6
+    - 0.05
+intent_transition:
+  single_intent_prob: 0.3
+  multi_intent_prob: 0.7
+  same_intent_multi_subintent_ratio: 0.8
+  cross_intent_jump: 0.2
+single_round_ratio: 0.05
+tone_distribution:
+  祈使句: 0.6
+  问句: 0.15
+  反问句: 0.1
+  倒装句: 0.05
+  长短复合句: 0.05
+  带错别字的请求: 0.05
+mood:
+  probability: 0.3
+  emotions:
+  - 兴奋
+  - 开心
+  - 愉快
+  - 平静
+  - 沮丧
+  - 悲伤
+  - 愤怒
+  - 焦虑
+intent_transition_constraint:
+  switch_at_terminal_turn_ratio: 0.2

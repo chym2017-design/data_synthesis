@@ -1,0 +1,20 @@
+{
+  "run_id": "45249907",
+  "type": "post",
+  "status": "done",
+  "start_time": "2026-07-14 15:48:51",
+  "params": {
+    "data_file": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\outputs\\1698039b\\data.csv",
+    "intent_file": "D:\\HW\\synth_engine_offline\\synth_engine\\synth_engine\\templates\\bank_intent\\intent.json",
+    "skip_embedding": false,
+    "skip_llm": false,
+    "para": 5,
+    "sample_size": null,
+    "similarity_threshold": 0.95
+  },
+  "results": {
+    "embedding": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\45249907\\embedding_similarity_check.csv",
+    "detail": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\45249907\\qc_detail_by_model.csv",
+    "summary": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\45249907\\qc_summary_voting.csv"
+  }
+}

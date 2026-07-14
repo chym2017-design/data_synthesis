@@ -1,0 +1,3 @@
+model: text-embedding-v3
+url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+api_key: sk-sp-2b8eceec7095436696d234ce0e51a491
