@@ -1,0 +1,15 @@
+{
+  "run_id": "df515726",
+  "type": "pre",
+  "status": "done",
+  "start_time": "2026-07-15 09:27:11",
+  "params": {
+    "intent_file": "D:\\HW\\synth_engine_offline\\synth_engine\\synth_engine\\templates\\bank_intent\\intent.json",
+    "para": 20,
+    "similarity_threshold": 0.7
+  },
+  "results": {
+    "quality": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\df515726\\quality_check_results.csv",
+    "similarity": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\df515726\\similarity_check_results.csv"
+  }
+}

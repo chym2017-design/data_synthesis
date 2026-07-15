@@ -1,0 +1,20 @@
+{
+  "run_id": "12e2be10",
+  "type": "post",
+  "status": "done",
+  "start_time": "2026-07-15 09:39:48",
+  "params": {
+    "data_file": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\outputs\\test_204114\\data.csv",
+    "intent_file": "D:\\HW\\synth_engine_offline\\synth_engine\\synth_engine\\templates\\bank_intent\\intent.json",
+    "skip_embedding": false,
+    "skip_llm": false,
+    "para": 20,
+    "sample_size": null,
+    "similarity_threshold": 0.95
+  },
+  "results": {
+    "embedding": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\12e2be10\\embedding_similarity_check.csv",
+    "detail": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\12e2be10\\qc_detail_by_model.csv",
+    "summary": "D:\\HW\\synth_engine_offline\\synth_engine\\runs\\qc_results\\12e2be10\\qc_summary_voting.csv"
+  }
+}

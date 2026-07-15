@@ -119,7 +119,7 @@ class QCPreRequest(BaseModel):
     """合成前质检 - 验证意图配置质量"""
     intent_file: str
     para: int = 3
-    similarity_threshold: float = 0.7
+    similarity_threshold: float = 0.90
 
 
 class QCPostRequest(BaseModel):
@@ -155,7 +155,7 @@ async def start_pre_qc(req: QCPreRequest):
                 status.run_id = run_id  # 确保 run_id 正确
                 _set_qc_run_status(run_id, status)
 
-            status_callback(RunStatus(run_id=run_id, stage="quality_check", message="正在执行菜单质检..."))
+            status_callback(RunStatus(run_id=run_id, stage="quality_check", total=0, current=0, message="正在执行菜单质检..."))
             results = pre_synthesis_qc(
                 intent_file=req.intent_file,
                 llm_configs=llm_configs,
@@ -167,7 +167,7 @@ async def start_pre_qc(req: QCPreRequest):
             )
 
             _set_qc_run_status(run_id, RunStatus(
-                run_id=run_id, stage="done",
+                run_id=run_id, stage="done", total=1, current=1,
                 message=f"质检完成，生成 {len(results)} 个结果文件",
             ))
             _save_meta(run_id, "pre", "done", req.model_dump(), results)
@@ -211,7 +211,7 @@ async def start_post_qc(req: QCPostRequest):
             results = {}
 
             if not req.skip_embedding:
-                status_callback(RunStatus(run_id=run_id, stage="embedding", message="正在执行 Embedding 相似度检测..."))
+                status_callback(RunStatus(run_id=run_id, stage="embedding", total=0, current=0, message="正在执行 Embedding 相似度检测..."))
                 emb_path = embedding_similarity_check(
                     data_file=req.data_file,
                     embedding_config=emb_config or {},
@@ -223,7 +223,7 @@ async def start_post_qc(req: QCPostRequest):
                 results["embedding"] = emb_path
 
             if not req.skip_llm and llm_configs:
-                status_callback(RunStatus(run_id=run_id, stage="llm_qc", message="正在执行 LLM 意图质检..."))
+                status_callback(RunStatus(run_id=run_id, stage="llm_qc", total=0, current=0, message="正在执行 LLM 意图质检..."))
                 llm_results = llm_qc_with_voting(
                     data_file=req.data_file,
                     intent_config=intent_config,
@@ -236,7 +236,7 @@ async def start_post_qc(req: QCPostRequest):
                 results.update(llm_results)
 
             _set_qc_run_status(run_id, RunStatus(
-                run_id=run_id, stage="done",
+                run_id=run_id, stage="done", total=1, current=1,
                 message=f"质检完成，生成 {len(results)} 个结果文件",
             ))
             _save_meta(run_id, "post", "done", req.model_dump(), results)
@@ -287,6 +287,9 @@ async def get_qc_status(run_id: str):
     result = {
         "run_id": status.run_id,
         "stage": status.stage,
+        "total": status.total,
+        "current": status.current,
+        "progress": status.progress,
         "message": status.message,
         "error": status.error,
         "start_time": start_time,
@@ -409,7 +412,7 @@ async def retry_qc(run_id: str):
         req = QCPreRequest(
             intent_file=params.get("intent_file", ""),
             para=params.get("para", 3),
-            similarity_threshold=params.get("similarity_threshold", 0.7),
+            similarity_threshold=params.get("similarity_threshold", 0.90),
         )
     else:
         from synth_engine.api.routes.qc import QCPostRequest

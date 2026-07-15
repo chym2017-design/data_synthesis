@@ -91,7 +91,7 @@ def pre_synthesis_qc(
     save_dir: str,
     para: int = 3,
     embedding_config: Optional[Dict] = None,
-    similarity_threshold: float = 0.7,
+    similarity_threshold: float = 0.90,
     status_callback: Optional[Callable[[RunStatus], None]] = None,
 ) -> Dict[str, str]:
     """
@@ -132,7 +132,11 @@ def pre_synthesis_qc(
         c["response_format"] = {"type": "json_object"}
         cfg_with_json.append(c)
 
-    df_qc = run_llm_para(queries, para, cfg_with_json)
+    df_qc = run_llm_para(queries, para, cfg_with_json,
+        progress_callback=lambda done, total: status_callback(
+            RunStatus(run_id="", stage="quality_check", total=total, current=done,
+                      message=f"正在执行菜单质检... ({done}/{total})")
+        ) if status_callback else None)
     if df_qc is not None:
         qc_records = []
         for i, (_, row) in enumerate(df_qc.iterrows()):
@@ -178,7 +182,7 @@ def pre_synthesis_qc(
         results["quality"] = quality_path
 
     if status_callback:
-        status_callback(RunStatus(run_id="", stage="similarity_check", message="正在检测相似菜单..."))
+        status_callback(RunStatus(run_id="", stage="similarity_check", total=len(menu_items), current=0, message="正在检测相似菜单..."))
 
     # 任务2：相似菜单检测
     if embedding_config and len(menu_items) > 1:
@@ -187,9 +191,11 @@ def pre_synthesis_qc(
         model = embedding_config.get("model", "text-embedding-v3")
 
         embeddings = []
-        for item in menu_items:
+        for i, item in enumerate(menu_items):
             emb = get_embedding(item["description"], base_url=base_url, api_key=api_key, model=model)
             embeddings.append(emb)
+            if status_callback and (i + 1) % 10 == 0:
+                status_callback(RunStatus(run_id="", stage="similarity_check", total=len(menu_items), current=i + 1, message=f"正在检测相似菜单... ({i + 1}/{len(menu_items)})"))
 
         sim_matrix = compute_cosine_similarity_matrix(embeddings)
         similar_pairs = []
@@ -240,6 +246,6 @@ def pre_synthesis_qc(
                 results["similarity"] = sim_path
 
     if status_callback:
-        status_callback(RunStatus(run_id="", stage="done", message="质检完成"))
+        status_callback(RunStatus(run_id="", stage="done", total=2, current=2, message="质检完成"))
 
     return results

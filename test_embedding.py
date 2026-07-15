@@ -56,6 +56,7 @@ def main():
         print("[错误] 请检查 configs/embedding_config.yaml (model/url/api_key)")
         sys.exit(1)
 
+
     print(f"\n{'='*80}")
     print(f"Embedding 模型: {model}")
     print(f"API 地址: {url}")

@@ -135,6 +135,7 @@ def embedding_similarity_check(
 
     df = pd.read_csv(data_file, index_col=0)
     df = _sample_dataframe(df, sample_size)
+    df = df.reset_index(drop=True)
 
     def parse_target(s):
         try:
@@ -223,6 +224,7 @@ def llm_qc_with_voting(
 
     df = pd.read_csv(data_file, index_col=0)
     df = _sample_dataframe(df, sample_size)
+    df = df.reset_index(drop=True)
 
     def parse_target(s):
         try:

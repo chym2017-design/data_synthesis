@@ -40,6 +40,7 @@ def run_llm_para(
     queries: List[str],
     para: int,
     config_lst: List[Dict[str, Any]],
+    progress_callback = None,
 ) -> Optional[pd.DataFrame]:
     """
     并行调用多个 LLM，负载均衡（轮询分配模型）。
@@ -48,6 +49,7 @@ def run_llm_para(
         queries: prompt 列表
         para: 并行度
         config_lst: 模型配置列表
+        progress_callback: 可选，每完成一个调用时回调 callback(completed, total)
 
     Returns:
         DataFrame with idx, question, response, model, etc.
@@ -57,6 +59,8 @@ def run_llm_para(
 
     # 过滤非千问模型（避免敏感词拒答）
     filtered_cfg = [c for c in config_lst if "qwen" not in c.get("model", "")]
+
+    total = len(queries)
 
     with ThreadPoolExecutor(max_workers=para) as exe:
         for i, q in enumerate(queries):
@@ -72,11 +76,13 @@ def run_llm_para(
             future = exe.submit(wrapped, q, **cfg)
             futures[future] = i
 
-        for future in tqdm(as_completed(futures), total=len(queries), desc="LLM calls"):
+        for future in tqdm(as_completed(futures), total=total, desc="LLM calls"):
             idx = futures[future]
             out = future.result()
             out["idx"] = idx
             results.append(out)
+            if progress_callback:
+                progress_callback(len(results), total)
 
     if not results:
         return None
