@@ -1,0 +1,21 @@
+[Unit]
+Description=Synth Engine web application
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f synth-engine
+ExecStart=/usr/bin/docker run --name synth-engine --pull=never --init \
+  --publish 127.0.0.1:8080:8080 \
+  --volume /opt/synth_engine/configs:/app/configs \
+  --volume /opt/synth_engine/runs:/app/runs \
+  --volume /opt/synth_engine/synth_engine/templates:/app/synth_engine/templates \
+  synth-engine:latest
+ExecStop=/usr/bin/docker stop -t 30 synth-engine
+
+[Install]
+WantedBy=multi-user.target
