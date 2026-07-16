@@ -7,16 +7,24 @@
 | 项目 | 当前值 |
 | --- | --- |
 | 服务器公网 IP | `101.245.66.42` |
-| 操作系统 | CentOS 7.9 |
+| 操作系统 | Ubuntu Server 24.04.4 LTS 64bit |
 | 访问地址 | `http://101.245.66.42/synth/` |
 | 网页认证用户名 | `synthadmin` |
 | 应用容器 | `synth-engine` |
 | 应用服务 | `synth-engine.service` |
 | 反向代理 | Nginx |
 | 应用内部端口 | `127.0.0.1:8080` |
-| 公网端口 | `80` |
+| 公网端口 | `80`（安全组中的 `22` 仅允许管理员当前公网 IP） |
 
-网页密码不要写入本文档、Git 仓库、脚本或命令历史。网页认证密码和 ECS 的 root 密码是两套完全独立的密码。
+网页密码不要写入本文档、Git 仓库、脚本或命令历史。当前系统涉及三类彼此独立的凭据：
+
+| 凭据 | 用在哪里 | 修改后影响什么 |
+| --- | --- | --- |
+| 网页账号 `synthadmin` 与网页密码 | 浏览器打开 `/synth/` 时的 Basic Auth | 只影响网页入口，不影响 SSH 和模型调用 |
+| ECS 的 root/SSH 密码或 SSH 私钥 | 登录 Ubuntu 服务器 | 只影响服务器运维，不会修改网页密码 |
+| LLM/Embedding API Key | Synth Engine 调用模型接口 | 只影响合成和质检，不会修改网页或 SSH 登录 |
+
+部署时生成的随机网页初始密码只临时保存在 `/root/synth-initial-credentials.txt`。管理员保存密码后应删除该明文文件。网页密码的长期存储文件 `/etc/nginx/.htpasswd-aiserver` 中只有密码哈希，不能从中还原明文密码。
 
 ## 2. 部署架构
 
@@ -34,7 +42,7 @@ Docker 容器 synth-engine
 FastAPI + Vue 前端
 ```
 
-服务器上原有的 `mcp-server` 容器使用公网 `8000` 端口，与本项目相互独立，不要误删或停止。
+当前新系统只部署了 `synth-engine` 容器，没有部署旧系统中的 `mcp-server`。Synth Engine 不使用公网 `8000` 端口。
 
 ## 3. 重要文件位置
 
@@ -50,12 +58,12 @@ FastAPI + Vue 前端
 | 合成输出 | `/opt/synth_engine/runs/outputs` |
 | 质检输出 | `/opt/synth_engine/runs/qc_results` |
 | Dockerfile | `/opt/synth_engine/Dockerfile` |
-| Nginx 配置 | `/etc/nginx/conf.d/aiserver.fun.conf` |
+| Nginx 配置 | `/etc/nginx/conf.d/synth-engine.conf` |
 | 网页密码文件 | `/etc/nginx/.htpasswd-aiserver` |
+| 初始网页凭据（使用后删除） | `/root/synth-initial-credentials.txt` |
 | systemd 服务 | `/etc/systemd/system/synth-engine.service` |
-| HTTPS 证书（保留） | `/etc/letsencrypt/live/aiserver.fun` |
 
-Nginx 配置文件名 `aiserver.fun.conf` 是历史命名；它目前也负责 IP 地址访问。
+当前没有使用域名或 HTTPS 证书，入口是 IP 地址上的 HTTP。Basic Auth 只能控制访问，不能加密传输内容。
 
 ### 3.2 Docker 容器
 
@@ -80,7 +88,7 @@ systemctl status nginx --no-pager
 docker ps
 ```
 
-三个服务正常时应显示 `active (running)`，容器列表中应同时存在 `synth-engine` 和原有的 `mcp-server`。
+三个服务正常时应显示 `active (running)`，`docker ps` 中应存在一个名为 `synth-engine` 的容器。
 
 ### 4.2 检查应用健康状态
 
@@ -102,6 +110,8 @@ curl http://127.0.0.1:8080/api/health
 curl -u synthadmin http://101.245.66.42/api/health
 ```
 
+`-u synthadmin` 表示使用网页账号 `synthadmin`。命令随后会提示输入网页密码，输入时密码不会显示在屏幕上。不要把密码直接写成 `-u synthadmin:明文密码`，否则可能被终端历史或进程列表记录。
+
 ### 4.3 检查监听端口
 
 ```bash
@@ -112,7 +122,6 @@ ss -lntp
 
 - `80`：Nginx 公网入口；
 - `127.0.0.1:8080`：Synth Engine，仅服务器本机可访问；
-- `8000`：原有 `mcp-server`；
 - `22`：SSH。
 
 ## 5. 服务启停与重启
@@ -149,7 +158,7 @@ tar -czf /opt/backups/synth-engine-data-$(date +%Y%m%d-%H%M%S).tar.gz \
   /opt/synth_engine/configs \
   /opt/synth_engine/runs \
   /opt/synth_engine/synth_engine/templates \
-  /etc/nginx/conf.d/aiserver.fun.conf \
+  /etc/nginx/conf.d/synth-engine.conf \
   /etc/nginx/.htpasswd-aiserver \
   /etc/systemd/system/synth-engine.service
 ```
@@ -199,7 +208,7 @@ docker tag synth-engine:latest synth-engine:rollback-$(date +%Y%m%d-%H%M%S)
 tar -xzf /tmp/synth-engine-update.tar.gz -C /opt/synth_engine
 
 # 构建新镜像
-DOCKER_BUILDKIT=1 docker build --network host -t synth-engine:latest .
+docker build --network host -t synth-engine:latest .
 
 # 重启并验证
 systemctl restart synth-engine
@@ -256,42 +265,90 @@ curl http://127.0.0.1:8080/api/health
 
 镜像回滚只回滚程序代码，不会回滚 `configs`、`runs` 和 `templates`。如果这些数据也被错误修改，需要从 `/opt/backups` 中单独恢复。
 
-不要使用 `docker system prune -a`，否则可能删除回滚镜像以及原有 `mcp-server` 相关镜像。
+不要使用 `docker system prune -a`，否则可能删除 Synth Engine 的回滚镜像和构建缓存。
 
-## 8. 修改网页访问密码
+## 8. 网页用户名与密码
 
-网页认证文件：
+浏览器打开 `http://101.245.66.42/synth/` 时出现的登录框由 Nginx Basic Auth 提供。它不是 Synth Engine 数据库账号，也不是 ECS 的 root 账号。
+
+Nginx 从下面的文件核对用户名和密码：
 
 ```text
 /etc/nginx/.htpasswd-aiserver
 ```
 
-文件中保存用户名和密码哈希，不保存明文密码。
+文件中每一行对应一个网页用户，格式类似 `用户名:密码哈希`。密码哈希用于验证输入是否正确，不能直接还原成明文密码。
 
-### 8.1 修改 `synthadmin` 密码
+### 8.1 查看部署时生成的初始账号
+
+只有首次部署并且尚未删除临时文件时，才能执行：
+
+```bash
+cat /root/synth-initial-credentials.txt
+```
+
+`cat` 的作用是把文件内容显示到终端。该文件包含一次性的明文初始密码，所以只能在自己的华为云控制台中查看，不要截图、复制到群聊或提交到 Git。确认已经把密码保存到密码管理器后，删除临时文件：
+
+```bash
+rm -f /root/synth-initial-credentials.txt
+```
+
+`rm -f` 表示删除指定文件。它不会删除 Nginx 密码哈希，因此删除后网页账号仍能正常登录，只是服务器不再保留可直接查看的明文密码。
+
+### 8.2 修改现有用户 `synthadmin` 的网页密码
+
+第一步，交互式设置新密码：
 
 ```bash
 htpasswd /etc/nginx/.htpasswd-aiserver synthadmin
-chown root:nginx /etc/nginx/.htpasswd-aiserver
+```
+
+这条命令的含义是：在密码文件中找到 `synthadmin`，用新密码哈希替换旧哈希。终端会要求输入两次新密码；输入过程中屏幕不显示字符，这是 Linux 的正常安全设计。
+
+第二步，恢复 Ubuntu Nginx 所需的文件所有者和权限：
+
+```bash
+chown root:www-data /etc/nginx/.htpasswd-aiserver
 chmod 640 /etc/nginx/.htpasswd-aiserver
+```
+
+- `chown root:www-data`：文件由 root 管理，同时允许 Ubuntu 的 Nginx 用户组 `www-data` 读取；
+- `chmod 640`：root 可以读写，`www-data` 只能读取，其他用户不能访问。
+
+第三步，检查配置并平滑重新加载：
+
+```bash
 nginx -t && systemctl reload nginx
 ```
 
-`htpasswd` 会要求输入两次新密码。输入时终端不会显示字符，这是正常现象。
+- `nginx -t`：先检查 Nginx 配置语法；
+- `&&`：只有前一个命令成功时才执行后一个命令；
+- `systemctl reload nginx`：不停止网站，重新读取配置和密码文件。
 
-### 8.2 修改网页用户名
+修改完成后，用浏览器无痕窗口重新登录验证。原密码会立即失效。
 
-先添加新用户，确认成功后再删除旧用户。以下示例将用户名改为 `admin`：
+### 8.3 修改网页用户名
+
+不要先删除旧用户。正确顺序是“添加新用户 → 验证新用户 → 删除旧用户”。以下示例把用户名从 `synthadmin` 改为 `admin`。
+
+第一步，添加新用户并设置密码：
 
 ```bash
 htpasswd /etc/nginx/.htpasswd-aiserver admin
-htpasswd -D /etc/nginx/.htpasswd-aiserver synthadmin
-chown root:nginx /etc/nginx/.htpasswd-aiserver
+chown root:www-data /etc/nginx/.htpasswd-aiserver
 chmod 640 /etc/nginx/.htpasswd-aiserver
+```
+
+此时 `synthadmin` 和 `admin` 都可以登录。先在浏览器无痕窗口中确认 `admin` 能成功登录，然后再删除旧用户：
+
+```bash
+htpasswd -D /etc/nginx/.htpasswd-aiserver synthadmin
 nginx -t && systemctl reload nginx
 ```
 
-不要使用带明文密码的 `htpasswd -b` 命令，否则密码会进入终端历史和进程参数。
+`htpasswd -D` 中的 `-D` 表示只删除指定用户名。它不会删除整个密码文件。
+
+不要使用 `htpasswd -b`。`-b` 会要求把明文密码直接写进命令，密码可能进入终端历史和进程参数。
 
 ## 9. ECS root 密码与 SSH 密钥
 
@@ -304,6 +361,8 @@ passwd root
 ```
 
 root 密码只用于 ECS/SSH，不是网页密码。
+
+`passwd root` 会要求输入两次新的 root 密码。修改 root 密码不会改变网页用户 `synthadmin` 的密码，也不会改变 LLM/Embedding API Key。
 
 ### 9.2 忘记 root 密码
 
@@ -333,26 +392,17 @@ systemctl status nginx --no-pager
 /root/.ssh/authorized_keys
 ```
 
-该文件曾设置不可变和仅追加属性。修改前检查：
-
-```bash
-lsattr /root/.ssh/authorized_keys
-```
-
-如显示 `i` 或 `a`，先解除属性：
-
-```bash
-chattr -ia /root/.ssh/authorized_keys
-```
-
-编辑或追加公钥后恢复权限：
+添加或删除公钥后恢复正确权限：
 
 ```bash
 chown root:root /root/.ssh/authorized_keys
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
-chattr +ia /root/.ssh/authorized_keys
 ```
+
+- `chmod 700 /root/.ssh`：只有 root 能进入 SSH 配置目录；
+- `chmod 600 authorized_keys`：只有 root 能读写允许登录的公钥清单；
+- 不要把 SSH 私钥写入 `authorized_keys`，这里保存的只能是 `.pub` 公钥内容。
 
 至少保留一种已经实际验证可登录的方式，再关闭当前 SSH 会话。不要在未验证新密钥时删除旧密钥或禁用密码登录。
 
@@ -377,8 +427,10 @@ tail -n 200 /var/log/nginx/error.log
 ### 10.3 SSH 登录日志
 
 ```bash
-tail -n 200 /var/log/secure
+tail -n 200 /var/log/auth.log
 ```
+
+Ubuntu 把 SSH 成功、失败和认证相关记录写入 `/var/log/auth.log`。`tail -n 200` 表示只显示最后 200 行，避免一次输出整个日志文件。
 
 ### 10.4 常见问题
 
@@ -403,7 +455,7 @@ systemctl restart synth-engine
 检查网页密码文件权限和 Nginx 日志：
 
 ```bash
-chown root:nginx /etc/nginx/.htpasswd-aiserver
+chown root:www-data /etc/nginx/.htpasswd-aiserver
 chmod 640 /etc/nginx/.htpasswd-aiserver
 nginx -t && systemctl reload nginx
 tail -n 100 /var/log/nginx/error.log
@@ -441,8 +493,7 @@ passwd -S root
 sshd -T | grep -E 'passwordauthentication|permitrootlogin|pubkeyauthentication'
 ls -ld /root /root/.ssh
 ls -l /root/.ssh/authorized_keys
-lsattr /root/.ssh/authorized_keys
-tail -n 100 /var/log/secure
+tail -n 100 /var/log/auth.log
 ```
 
 如果没有任何可用会话，通过华为云控制台重置 root 密码。
@@ -494,11 +545,11 @@ curl http://127.0.0.1:8080/api/health
 
 ## 13. 安全注意事项
 
-1. 当前使用 HTTP IP 访问，网页认证和业务内容没有 HTTPS 加密，不要在不可信网络中使用。
+1. 当前使用 HTTP IP 访问，网页认证和业务内容没有 HTTPS 加密，不要在酒店等不可信网络中直接使用；优先通过可信 VPN 或后续配置 HTTPS。
 2. 不要把 `configs/*.yaml`、网页密码、root 密码或私钥提交到公开 Git 仓库。
 3. 修改 SSH 配置前保持一个已登录终端，修改后先执行 `sshd -t`。
 4. 不要直接开放 `8080` 到公网。
-5. 不要删除或停止不属于本项目的 `mcp-server` 容器。
-6. 定期更新 API 密钥、网页密码和 root 密码。
-7. 重要更新前同时保留代码镜像回滚点和持久化数据备份。
-
+5. 当前新系统没有部署 `mcp-server`；如以后重新部署 8000 端口服务，应限制调用来源或放在 Nginx 后面。
+6. 定期更新 API 密钥和网页密码；root/SSH 优先使用密钥登录并关闭公网密码登录。
+7. 安全组中的 SSH 22 端口只允许管理员当前公网 IP `/32`，不要长期使用 `0.0.0.0/0`。
+8. 重要更新前同时保留代码镜像回滚点和持久化数据备份，并把备份下载到另一台设备。
