@@ -19,6 +19,7 @@ from synth_engine.core.models import SynthSample, RunStatus
 from synth_engine.core.profile_gen import ConfigDrivenProfileGenerator
 from synth_engine.core.utils import weighted_choice
 from synth_engine.llm.parallel import run_llm_para
+from synth_engine.limits import LIMITS
 from synth_engine.templates.base import SynthTemplate
 from synth_engine.templates.registry import TemplateRegistry
 
@@ -237,19 +238,47 @@ class SynthesisPipeline:
         ]
         return "\n".join(lines)
 
-    def call_llm(self, samples: List[SynthSample], llm_configs: List[Dict], para: int = 3, template_name: str = "multi_round.md"):
+    def call_llm(
+        self,
+        samples: List[SynthSample],
+        llm_configs: List[Dict],
+        para: int = LIMITS.model_parallelism.default,
+        template_name: str = "multi_round.md",
+        progress_offset: int = 0,
+        progress_total: Optional[int] = None,
+    ):
         """
         Step 2: 调用 LLM 生成对话
         """
+        overall_total = progress_total if progress_total is not None else len(samples)
+        phase_label = "多轮对话" if template_name == "multi_round.md" else "单轮对话"
         self._emit_status(RunStatus(
             run_id=self.run_dir.name, stage="calling_llm",
-            total=len(samples), current=0, message=f"调用 LLM 生成对话 ({template_name})...",
+            total=overall_total, current=progress_offset,
+            message=f"正在生成{phase_label}... (0/{len(samples)})",
         ))
 
         prompt_path = str(self.template_dir / "prompts" / template_name)
         prompts = [self.template.build_prompt(s, prompt_path) for s in samples]
 
-        df_results = run_llm_para(prompts, para, llm_configs)
+        def progress_callback(done: int, phase_total: int):
+            self._emit_status(RunStatus(
+                run_id=self.run_dir.name,
+                stage="calling_llm",
+                total=overall_total,
+                current=progress_offset + done,
+                message=(
+                    f"正在生成{phase_label}... ({done}/{phase_total})，"
+                    f"模型总进度 {progress_offset + done}/{overall_total}"
+                ),
+            ))
+
+        df_results = run_llm_para(
+            prompts,
+            para,
+            llm_configs,
+            progress_callback=progress_callback,
+        )
 
         if df_results is None:
             self._emit_status(RunStatus(
@@ -267,15 +296,17 @@ class SynthesisPipeline:
 
         log_cols = ["idx", "question", "model", "status_code", "err_msg", "duration"]
         cols = [c for c in log_cols if c in df_results.columns]
-        df_results[cols].to_json(
-            str(self.run_dir / "llm_log.jsonl"),
-            orient="records", lines=True, force_ascii=False,
-        )
+        # 多轮和单轮分两批调用，日志必须追加，不能让后一批覆盖前一批。
+        with open(self.run_dir / "llm_log.jsonl", "a", encoding="utf-8") as log_file:
+            df_results[cols].to_json(
+                log_file,
+                orient="records", lines=True, force_ascii=False,
+            )
 
         self._emit_status(RunStatus(
             run_id=self.run_dir.name, stage="calling_llm",
-            total=len(samples), current=len(samples),
-            message=f"LLM 调用完成 ({template_name}): {len(samples)} 条",
+            total=overall_total, current=progress_offset + len(samples),
+            message=f"{phase_label}生成完成: {len(samples)} 条，模型总进度 {progress_offset + len(samples)}/{overall_total}",
         ))
         return samples
 
@@ -375,15 +406,29 @@ class SynthesisPipeline:
         ))
         return csv_path
 
-    def run(self, num_samples: int, llm_configs: List[Dict], para: int = 3) -> str:
+    def run(
+        self,
+        num_samples: int,
+        llm_configs: List[Dict],
+        para: int = LIMITS.model_parallelism.default,
+    ) -> str:
         """执行完整流水线"""
         single_round, multi_round = self.generate_intent_samples(num_samples)
 
-        # 分别调用 LLM
+        # 分别调用 LLM，但对前端呈现为一个连续、单调递增的模型总进度。
+        llm_total = len(multi_round) + len(single_round)
+        llm_completed = 0
         if multi_round:
-            multi_round = self.call_llm(multi_round, llm_configs, para, "multi_round.md")
+            multi_round = self.call_llm(
+                multi_round, llm_configs, para, "multi_round.md",
+                progress_offset=llm_completed, progress_total=llm_total,
+            )
+            llm_completed += len(multi_round)
         if single_round:
-            single_round = self.call_llm(single_round, llm_configs, para, "single_round.md")
+            single_round = self.call_llm(
+                single_round, llm_configs, para, "single_round.md",
+                progress_offset=llm_completed, progress_total=llm_total,
+            )
 
         # 拆分单轮样本
         single_round = self.split_single_round(single_round)

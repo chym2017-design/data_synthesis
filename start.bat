@@ -1,34 +1,21 @@
 @echo off
+chcp 65001 >nul
 cd /d "%~dp0"
+title Synth Engine Local Development
 
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python not found. Please install Python 3.10+
-    pause
-    exit /b 1
-)
-
-if not exist ".deps_installed" (
-    echo [1/2] Installing dependencies...
-    python -m pip install --no-index --find-links=wheels -r requirements.txt -q 2>nul
-    if %errorlevel% neq 0 (
-        echo Offline install failed, trying online...
-        python -m pip install -r requirements.txt -q
-        if %errorlevel% neq 0 (
-            echo [ERROR] Dependency install failed
-            pause
-            exit /b 1
-        )
-    )
-    echo installed > .deps_installed
-    echo       Done
-) else (
-    echo [1/2] Dependencies already installed, skip
-)
-
-echo [2/2] Starting server...
-echo       Open http://localhost:8080
-echo       Press Ctrl+C to stop
 echo ============================================
-python -m uvicorn synth_engine.api.main:app --host 0.0.0.0 --port 8080
-pause
+echo   Synth Engine 本地测试环境
+echo   前端: http://127.0.0.1:3000/synth/
+echo   后端: http://127.0.0.1:8080
+echo   停止: Ctrl+C
+echo ============================================
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_local.ps1"
+set "exit_code=%errorlevel%"
+
+if not "%exit_code%"=="0" (
+    echo.
+    echo [ERROR] 启动脚本异常退出，错误码 %exit_code%
+    pause
+)
+exit /b %exit_code%

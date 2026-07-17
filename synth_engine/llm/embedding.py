@@ -16,6 +16,7 @@ def get_embedding(
     model: str,
     system_prompt: str = "将银行客服对话文本转换为语义向量表示，用于计算文本之间的语义相似度",
     timeout: int = 30,
+    raise_on_error: bool = False,
 ) -> Optional[np.ndarray]:
     """获取文本的 embedding 向量"""
     try:
@@ -27,6 +28,8 @@ def get_embedding(
         )
         return np.array(completion.data[0].embedding)
     except Exception as e:
+        if raise_on_error:
+            raise RuntimeError(str(e)) from e
         print(f"Error getting embedding: {e}")
         return None
 

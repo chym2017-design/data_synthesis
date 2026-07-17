@@ -5,18 +5,21 @@
 """
 
 import json
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from synth_engine.core.models import RunStatus
+from synth_engine.limits import LIMITS
 from synth_engine.qc.pre_check import pre_synthesis_qc
 from synth_engine.qc.post_check import embedding_similarity_check, llm_qc_with_voting
+from synth_engine.task_queue import task_queue
+from synth_engine.task_ids import generate_task_id
+from synth_engine.tenant import current_workspace
 
 router = APIRouter()
 
@@ -25,15 +28,16 @@ import threading
 _qc_lock = threading.Lock()
 _active_qc_runs: Dict[str, Dict] = {}  # run_id -> {"status": RunStatus, "start_time": str}
 _qc_cancel_flags: Dict[str, bool] = {}
-RUNS_DIR = Path(__file__).parent.parent.parent.parent / "runs"
-CONFIGS_DIR = Path(__file__).parent.parent.parent.parent / "configs"
-LLM_CONFIG_PATH = CONFIGS_DIR / "llm_config.yaml"
-EMBEDDING_CONFIG_PATH = CONFIGS_DIR / "embedding_config.yaml"
-TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
-
-
 def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _workspace_file(path_value: str, workspace_root: Path) -> Path:
+    path = Path(path_value).resolve()
+    root = workspace_root.resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(status_code=400, detail="所选文件不属于当前工作空间")
+    return path
 
 
 def _set_qc_run_status(run_id: str, status: RunStatus):
@@ -55,28 +59,28 @@ def _get_dir_mtime(dir_path: Path) -> str:
         return ""
 
 
-def _load_llm_configs() -> List[Dict]:
-    if LLM_CONFIG_PATH.exists():
-        with open(LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
+def _load_llm_configs(config_path: Path) -> List[Dict]:
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
             if isinstance(cfg, list):
                 return cfg
     return []
 
 
-def _load_embedding_config() -> Optional[Dict]:
+def _load_embedding_config(config_path: Path) -> Optional[Dict]:
     """从配置文件加载 Embedding 配置"""
-    if EMBEDDING_CONFIG_PATH.exists():
-        with open(EMBEDDING_CONFIG_PATH, "r", encoding="utf-8") as f:
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
             if isinstance(cfg, dict) and cfg.get("api_key") and cfg.get("url"):
                 return cfg
     return None
 
 
-def _save_meta(run_id: str, qc_type: str, status: str, params: Dict, results: Dict):
+def _save_meta(runs_dir: Path, run_id: str, qc_type: str, status: str, params: Dict, results: Dict):
     """持久化 QC 任务元数据到磁盘"""
-    meta_path = RUNS_DIR / "qc_results" / run_id / "meta.json"
+    meta_path = runs_dir / "qc_results" / run_id / "meta.json"
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     start_time = _active_qc_runs.get(run_id, {}).get("start_time", "")
     meta = {
@@ -94,9 +98,10 @@ def _save_meta(run_id: str, qc_type: str, status: str, params: Dict, results: Di
 @router.get("/available_files")
 async def get_available_files():
     """列出可用于质检的文件（所有运行输出中的 CSV 和 intent.json）"""
+    ws = current_workspace()
     files = {"data_csv": [], "intent_json": []}
 
-    outputs_dir = RUNS_DIR / "outputs"
+    outputs_dir = ws.runs_dir / "outputs"
     if outputs_dir.exists():
         for d in outputs_dir.iterdir():
             if d.is_dir():
@@ -105,8 +110,8 @@ async def get_available_files():
                     files["data_csv"].append({"run_id": d.name, "path": str(csv)})
 
     # 扫描模板中的 intent.json
-    if TEMPLATES_DIR.exists():
-        for d in TEMPLATES_DIR.iterdir():
+    if ws.templates_dir.exists():
+        for d in ws.templates_dir.iterdir():
             if d.is_dir():
                 intent = d / "intent.json"
                 if intent.exists():
@@ -118,7 +123,8 @@ async def get_available_files():
 class QCPreRequest(BaseModel):
     """合成前质检 - 验证意图配置质量"""
     intent_file: str
-    para: int = 3
+    para: int = Field(default=LIMITS.model_parallelism.default, ge=1, le=LIMITS.model_parallelism.max)
+    sample_size: int = Field(default=LIMITS.task_items.qc_pre, ge=1, le=LIMITS.task_items.qc_pre)
     similarity_threshold: float = 0.90
 
 
@@ -128,24 +134,26 @@ class QCPostRequest(BaseModel):
     intent_file: str
     skip_embedding: bool = False
     skip_llm: bool = False
-    para: int = 3
-    sample_size: Optional[int] = None
+    para: int = Field(default=LIMITS.model_parallelism.default, ge=1, le=LIMITS.model_parallelism.max)
+    sample_size: int = Field(default=LIMITS.task_items.qc_post, ge=1, le=LIMITS.task_items.qc_post)
     similarity_threshold: float = 0.95
 
 
 @router.post("/pre_check")
 async def start_pre_qc(req: QCPreRequest):
     """启动合成前质检（异步）"""
-    run_id = str(uuid.uuid4())[:8]
-    save_dir = str(RUNS_DIR / "qc_results" / run_id)
+    ws = current_workspace()
+    intent_file = _workspace_file(req.intent_file, ws.root)
+    run_id = generate_task_id(ws.username, "quality_bef")
+    save_dir = str(ws.runs_dir / "qc_results" / run_id)
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
-    llm_configs = _load_llm_configs()
-    emb_config = _load_embedding_config()
+    llm_configs = _load_llm_configs(ws.configs_dir / "llm_config.yaml")
+    emb_config = _load_embedding_config(ws.configs_dir / "embedding_config.yaml")
 
     _active_qc_runs[run_id] = {"status": RunStatus(
-        run_id=run_id, stage="starting", message="任务已提交，等待处理...",
-    ), "start_time": _now_str()}
+        run_id=run_id, stage="queued", message="任务已提交，等待处理...",
+    ), "start_time": _now_str(), "workspace_id": ws.workspace_id, "username": ws.username, "type": "pre"}
 
     import threading
 
@@ -157,48 +165,72 @@ async def start_pre_qc(req: QCPreRequest):
 
             status_callback(RunStatus(run_id=run_id, stage="quality_check", total=0, current=0, message="正在执行菜单质检..."))
             results = pre_synthesis_qc(
-                intent_file=req.intent_file,
+                intent_file=str(intent_file),
                 llm_configs=llm_configs,
                 save_dir=save_dir,
                 para=req.para,
                 embedding_config=emb_config,
                 similarity_threshold=req.similarity_threshold,
+                max_items=req.sample_size,
                 status_callback=status_callback,
             )
 
             _set_qc_run_status(run_id, RunStatus(
                 run_id=run_id, stage="done", total=1, current=1,
-                message=f"质检完成，生成 {len(results)} 个结果文件",
+                message=f"合成前质检已完成，生成 {len(results)} 个结果文件",
             ))
-            _save_meta(run_id, "pre", "done", req.model_dump(), results)
+            _save_meta(ws.runs_dir, run_id, "pre", "done", req.model_dump(), results)
         except Exception as e:
             _set_qc_run_status(run_id, RunStatus(
                 run_id=run_id, stage="error",
                 error=str(e), message=f"质检失败: {str(e)}",
             ))
-            _save_meta(run_id, "pre", "error", req.model_dump(), {"error": str(e)})
+            _save_meta(ws.runs_dir, run_id, "pre", "error", req.model_dump(), {"error": str(e)})
+            raise
 
-    threading.Thread(target=run_pre_qc, daemon=True).start()
+    def on_start():
+        _set_qc_run_status(run_id, RunStatus(
+            run_id=run_id, stage="starting", total=req.sample_size, current=0,
+            message="任务已出队，正在启动...",
+        ))
 
-    return {"run_id": run_id, "status": "starting", "message": "质检任务已提交"}
+    queue_info = task_queue.submit(
+        job_id=run_id,
+        username=ws.username,
+        workspace_id=ws.workspace_id,
+        task_type="qc_pre",
+        function=run_pre_qc,
+        on_start=on_start,
+    )
+    position = queue_info.get("queue_position", 0)
+    if queue_info.get("state") == "queued":
+        _set_qc_run_status(run_id, RunStatus(
+            run_id=run_id, stage="queued", total=req.sample_size, current=0,
+            message=f"任务已排队，当前位置 {position}",
+        ))
+
+    return {"run_id": run_id, "status": "queued", "message": f"质检任务已提交，排队位置 {position}"}
 
 
 @router.post("/post_check")
 async def start_post_qc(req: QCPostRequest):
     """启动合成后质检（异步）"""
-    run_id = str(uuid.uuid4())[:8]
-    save_dir = str(RUNS_DIR / "qc_results" / run_id)
+    ws = current_workspace()
+    data_file = _workspace_file(req.data_file, ws.root)
+    intent_file = _workspace_file(req.intent_file, ws.root)
+    run_id = generate_task_id(ws.username, "quality_after")
+    save_dir = str(ws.runs_dir / "qc_results" / run_id)
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
-    llm_configs = _load_llm_configs()
-    emb_config = _load_embedding_config()
+    llm_configs = _load_llm_configs(ws.configs_dir / "llm_config.yaml")
+    emb_config = _load_embedding_config(ws.configs_dir / "embedding_config.yaml")
 
-    with open(req.intent_file, "r", encoding="utf-8") as f:
+    with open(intent_file, "r", encoding="utf-8") as f:
         intent_config = json.load(f)
 
     _active_qc_runs[run_id] = {"status": RunStatus(
-        run_id=run_id, stage="starting", message="任务已提交，等待处理...",
-    ), "start_time": _now_str()}
+        run_id=run_id, stage="queued", message="任务已提交，等待处理...",
+    ), "start_time": _now_str(), "workspace_id": ws.workspace_id, "username": ws.username, "type": "post"}
 
     import threading
 
@@ -213,7 +245,7 @@ async def start_post_qc(req: QCPostRequest):
             if not req.skip_embedding:
                 status_callback(RunStatus(run_id=run_id, stage="embedding", total=0, current=0, message="正在执行 Embedding 相似度检测..."))
                 emb_path = embedding_similarity_check(
-                    data_file=req.data_file,
+                    data_file=str(data_file),
                     embedding_config=emb_config or {},
                     save_dir=save_dir,
                     threshold=req.similarity_threshold,
@@ -223,9 +255,9 @@ async def start_post_qc(req: QCPostRequest):
                 results["embedding"] = emb_path
 
             if not req.skip_llm and llm_configs:
-                status_callback(RunStatus(run_id=run_id, stage="llm_qc", total=0, current=0, message="正在执行 LLM 意图质检..."))
+                status_callback(RunStatus(run_id=run_id, stage="llm_level1", total=0, current=0, message="正在准备一级意图判定..."))
                 llm_results = llm_qc_with_voting(
-                    data_file=req.data_file,
+                    data_file=str(data_file),
                     intent_config=intent_config,
                     llm_configs=llm_configs,
                     save_dir=save_dir,
@@ -237,25 +269,49 @@ async def start_post_qc(req: QCPostRequest):
 
             _set_qc_run_status(run_id, RunStatus(
                 run_id=run_id, stage="done", total=1, current=1,
-                message=f"质检完成，生成 {len(results)} 个结果文件",
+                message=f"合成后质检已完成，生成 {len(results)} 个结果文件",
             ))
-            _save_meta(run_id, "post", "done", req.model_dump(), results)
+            _save_meta(ws.runs_dir, run_id, "post", "done", req.model_dump(), results)
         except Exception as e:
             _set_qc_run_status(run_id, RunStatus(
                 run_id=run_id, stage="error",
                 error=str(e), message=f"质检失败: {str(e)}",
             ))
-            _save_meta(run_id, "post", "error", req.model_dump(), {"error": str(e)})
+            _save_meta(ws.runs_dir, run_id, "post", "error", req.model_dump(), {"error": str(e)})
+            raise
 
-    threading.Thread(target=run_post_qc, daemon=True).start()
+    def on_start():
+        _set_qc_run_status(run_id, RunStatus(
+            run_id=run_id, stage="starting", total=req.sample_size, current=0,
+            message="任务已出队，正在启动...",
+        ))
 
-    return {"run_id": run_id, "status": "starting", "message": "质检任务已提交"}
+    queue_info = task_queue.submit(
+        job_id=run_id,
+        username=ws.username,
+        workspace_id=ws.workspace_id,
+        task_type="qc_post",
+        function=run_post_qc,
+        on_start=on_start,
+    )
+    position = queue_info.get("queue_position", 0)
+    if queue_info.get("state") == "queued":
+        _set_qc_run_status(run_id, RunStatus(
+            run_id=run_id, stage="queued", total=req.sample_size, current=0,
+            message=f"任务已排队，当前位置 {position}",
+        ))
+
+    return {"run_id": run_id, "status": "queued", "message": f"质检任务已提交，排队位置 {position}"}
 
 
 @router.get("/status/{run_id}")
 async def get_qc_status(run_id: str):
     """获取质检任务状态"""
-    qc_results_dir = RUNS_DIR / "qc_results"
+    ws = current_workspace()
+    qc_results_dir = ws.runs_dir / "qc_results"
+
+    if run_id in _active_qc_runs and _active_qc_runs[run_id].get("workspace_id") != ws.workspace_id:
+        raise HTTPException(status_code=404, detail=f"质检任务 {run_id} 不存在")
 
     if run_id not in _active_qc_runs:
         # 尝试从磁盘恢复状态
@@ -275,17 +331,12 @@ async def get_qc_status(run_id: str):
         raise HTTPException(status_code=404, detail=f"质检任务 {run_id} 不存在")
 
     status = _active_qc_runs[run_id]["status"]
-    start_time = _active_qc_runs[run_id].get("start_time", "")
-
-    # 如果内存状态不是 done/error，但磁盘上已有结果文件，说明已完成
-    if status.stage not in ("done", "error") and (qc_results_dir / run_id).exists():
-        result_files = list((qc_results_dir / run_id).glob("*.csv"))
-        if result_files:
-            status.stage = "done"
-            status.message = "质检完成"
+    active_entry = _active_qc_runs[run_id]
+    start_time = active_entry.get("start_time", "")
 
     result = {
         "run_id": status.run_id,
+        "type": active_entry.get("type", ""),
         "stage": status.stage,
         "total": status.total,
         "current": status.current,
@@ -294,6 +345,16 @@ async def get_qc_status(run_id: str):
         "error": status.error,
         "start_time": start_time,
     }
+    queue_info = task_queue.status(run_id)
+    if queue_info:
+        result.update({
+            "queue_position": queue_info.get("queue_position", 0),
+            "queued_count": queue_info.get("queued_count", 0),
+            "running_count": queue_info.get("running_count", 0),
+            "max_concurrent": queue_info.get("max_concurrent", LIMITS.max_concurrent_tasks),
+        })
+        if status.stage == "queued":
+            result["message"] = f"排队中，当前位置 {queue_info.get('queue_position', 0)}，全局等待 {queue_info.get('queued_count', 0)} 个"
 
     # 如果已完成，附带结果文件列表
     if status.stage == "done":
@@ -307,14 +368,20 @@ async def get_qc_status(run_id: str):
 @router.get("/list")
 async def list_qc_runs():
     """列出所有质检任务"""
-    qc_results_dir = RUNS_DIR / "qc_results"
+    ws = current_workspace()
+    qc_results_dir = ws.runs_dir / "qc_results"
 
     runs = []
     seen_ids = set()
 
     # 从内存获取活跃任务
-    qc_running_stages = {"starting", "quality_check", "similarity_check", "embedding", "llm_qc"}
+    qc_running_stages = {
+        "queued", "starting", "quality_check", "similarity_check", "embedding",
+        "llm_qc", "llm_level1", "llm_level2", "llm_summary",
+    }
     for run_id_entry, entry in _active_qc_runs.items():
+        if entry.get("workspace_id") != ws.workspace_id:
+            continue
         s = entry["status"]
         start_time = entry.get("start_time", "")
         run_dir = qc_results_dir / s.run_id
@@ -328,24 +395,29 @@ async def list_qc_runs():
         else:
             stage = s.stage
 
-        # 读取 meta.json 获取类型
-        qc_type = ""
+        # 活跃任务在提交时就记录类型；meta.json 只在任务结束后才存在。
+        qc_type = entry.get("type", "")
         meta_path = run_dir / "meta.json"
         if meta_path.exists():
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-                qc_type = meta.get("type", "")
+                qc_type = meta.get("type", qc_type)
 
         result_files = [f.name for f in run_dir.glob("*.csv")] if dir_exists else []
 
-        runs.append({
+        item = {
             "run_id": s.run_id,
             "type": qc_type,
             "stage": stage,
             "message": s.message,
             "files": result_files,
             "start_time": start_time,
-        })
+        }
+        queue_info = task_queue.status(s.run_id)
+        if queue_info:
+            item["queue_position"] = queue_info.get("queue_position", 0)
+            item["queued_count"] = queue_info.get("queued_count", 0)
+        runs.append(item)
         seen_ids.add(s.run_id)
 
     # 扫描磁盘上已有但未在内存中的 QC 结果目录
@@ -386,14 +458,16 @@ async def cancel_qc(run_id: str):
     s = _active_qc_runs[run_id]["status"]
     if s.stage in ("done", "error", "cancelled"):
         raise HTTPException(status_code=400, detail=f"任务已结束，无法取消")
-    _qc_cancel_flags[run_id] = True
-    return {"status": "ok", "message": "取消请求已发送"}
+    if task_queue.cancel(run_id):
+        _set_qc_run_status(run_id, RunStatus(run_id=run_id, stage="cancelled", message="排队任务已取消"))
+        return {"status": "ok", "message": "排队任务已取消"}
+    raise HTTPException(status_code=400, detail="任务已经开始运行，当前版本不能安全中止")
 
 
 @router.post("/retry/{run_id}")
 async def retry_qc(run_id: str):
     """重试失败的质检任务"""
-    qc_results_dir = RUNS_DIR / "qc_results"
+    qc_results_dir = current_workspace().runs_dir / "qc_results"
     meta_path = qc_results_dir / run_id / "meta.json"
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail=f"质检任务 {run_id} 不存在")
@@ -404,14 +478,15 @@ async def retry_qc(run_id: str):
     params = meta.get("params", {})
     qc_type = meta.get("type", "")
 
-    import uuid
-    new_run_id = str(uuid.uuid4())[:8]
+    task_type = "quality_bef" if qc_type == "pre" else "quality_after"
+    new_run_id = generate_task_id(current_workspace().username, task_type)
 
     if qc_type == "pre":
         from synth_engine.api.routes.qc import QCPreRequest
         req = QCPreRequest(
             intent_file=params.get("intent_file", ""),
-            para=params.get("para", 3),
+            para=params.get("para", LIMITS.model_parallelism.default),
+            sample_size=params.get("sample_size", LIMITS.task_items.qc_pre),
             similarity_threshold=params.get("similarity_threshold", 0.90),
         )
     else:
@@ -421,8 +496,8 @@ async def retry_qc(run_id: str):
             intent_file=params.get("intent_file", ""),
             skip_embedding=params.get("skip_embedding", False),
             skip_llm=params.get("skip_llm", False),
-            para=params.get("para", 3),
-            sample_size=params.get("sample_size"),
+            para=params.get("para", LIMITS.model_parallelism.default),
+            sample_size=params.get("sample_size", LIMITS.task_items.qc_post),
             similarity_threshold=params.get("similarity_threshold", 0.95),
         )
 
@@ -438,7 +513,7 @@ async def retry_qc(run_id: str):
 @router.get("/stats/{run_id}")
 async def get_qc_stats(run_id: str):
     """获取质检任务的统计信息"""
-    qc_results_dir = RUNS_DIR / "qc_results"
+    qc_results_dir = current_workspace().runs_dir / "qc_results"
     meta_path = qc_results_dir / run_id / "meta.json"
 
     stats = {"run_id": run_id}
@@ -475,3 +550,4 @@ async def get_qc_stats(run_id: str):
         stats["severity_distribution"] = sev_counts
 
     return stats
+    ws = current_workspace()

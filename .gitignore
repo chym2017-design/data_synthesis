@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.deps_installed
+data/
+workspaces/
+frontend/node_modules/
+logs/
+synth-engine-update.tar.gz
+synth_engine_源码参考/

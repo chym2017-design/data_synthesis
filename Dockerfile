@@ -14,7 +14,7 @@ RUN python -m pip install --no-cache-dir \
 COPY synth_engine /app/synth_engine
 COPY frontend /app/frontend
 COPY configs /app/configs
-COPY runs /app/runs
+RUN mkdir -p /app/configs /app/runs
 
 EXPOSE 8080
 

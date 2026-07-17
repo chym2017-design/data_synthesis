@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+username="${1:-synthadmin}"
+source_dir="/opt/synth_engine/runs"
+workspace_id="$(docker exec synth-engine python -c "from synth_engine.tenant import workspace_for_user; ctx=workspace_for_user('${username}'); print(ctx.workspace_id if ctx else '')")"
+
+[[ "$workspace_id" =~ ^[0-9a-f]{32}$ ]] || {
+  echo "无法取得用户 ${username} 的有效工作空间 UUID" >&2
+  exit 1
+}
+
+target_dir="/opt/synth_engine/workspaces/${workspace_id}/runs"
+[[ "$target_dir" == /opt/synth_engine/workspaces/*/runs ]] || {
+  echo "拒绝使用意外的目标路径: $target_dir" >&2
+  exit 1
+}
+[[ -d "$source_dir" ]] || {
+  echo "旧共享结果目录不存在: $source_dir" >&2
+  exit 1
+}
+
+mkdir -p "$target_dir"
+cp -a "$source_dir"/. "$target_dir"/
+echo "旧共享结果已复制到 ${username}: ${target_dir}"

@@ -1,0 +1,16 @@
+# Synth Engine 系统级任务限制。
+# 修改后需要重启后端服务；前端会通过后端接口自动读取这些值。
+
+# 每个任务一次最多处理的条目数。合成，前质检，后质检
+task_items:
+  synthesis: 30
+  qc_pre: 20
+  qc_post: 20
+
+# 单个任务内部调用模型时的并行度。
+model_parallelism:
+  default: 3
+  max: 5
+
+# 所有用户共享的任务队列最多同时运行多少个任务。
+max_concurrent_tasks: 5

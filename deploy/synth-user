@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HTPASSWD_FILE="/etc/nginx/.htpasswd-aiserver"
+CONTAINER="synth-engine"
+
+usage() {
+  echo "用法: synth-user {create|passwd|enable|disable|list} [用户名]" >&2
+  exit 2
+}
+
+require_user() {
+  [[ $# -eq 2 ]] || usage
+  [[ "$2" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,31}$ ]] || {
+    echo "用户名必须为 2-32 位字母、数字、点、下划线或短横线" >&2
+    exit 2
+  }
+}
+
+command -v htpasswd >/dev/null || {
+  echo "缺少 htpasswd，请执行: apt-get update && apt-get install -y apache2-utils" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  create)
+    require_user "$@"
+    user="$2"
+    if cut -d: -f1 "$HTPASSWD_FILE" 2>/dev/null | grep -qxF "$user"; then
+      echo "网页账号已存在；如需改密码请使用: synth-user passwd $user" >&2
+      exit 1
+    fi
+    touch "$HTPASSWD_FILE"
+    htpasswd -B "$HTPASSWD_FILE" "$user"
+    if ! docker exec "$CONTAINER" python -m synth_engine.admin create "$user"; then
+      htpasswd -D "$HTPASSWD_FILE" "$user" >/dev/null 2>&1 || true
+      echo "工作空间创建失败，已回滚网页账号" >&2
+      exit 1
+    fi
+    chown root:www-data "$HTPASSWD_FILE"
+    chmod 640 "$HTPASSWD_FILE"
+    nginx -t && systemctl reload nginx
+    echo "用户 $user 已创建；密码只保存为 bcrypt 哈希，无法查看明文。"
+    ;;
+  passwd)
+    require_user "$@"
+    cut -d: -f1 "$HTPASSWD_FILE" 2>/dev/null | grep -qxF "$2" || { echo "用户不存在" >&2; exit 1; }
+    htpasswd -B "$HTPASSWD_FILE" "$2"
+    chown root:www-data "$HTPASSWD_FILE"
+    chmod 640 "$HTPASSWD_FILE"
+    nginx -t && systemctl reload nginx
+    echo "用户 $2 的网页密码已修改。"
+    ;;
+  enable)
+    require_user "$@"
+    docker exec "$CONTAINER" python -m synth_engine.admin enable "$2"
+    echo "用户 $2 已启用。"
+    ;;
+  disable)
+    require_user "$@"
+    docker exec "$CONTAINER" python -m synth_engine.admin disable "$2"
+    echo "用户 $2 已停用；其文件仍保留。"
+    ;;
+  list)
+    [[ $# -eq 1 ]] || usage
+    docker exec "$CONTAINER" python -m synth_engine.admin list
+    ;;
+  *) usage ;;
+esac

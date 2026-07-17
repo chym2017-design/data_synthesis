@@ -6,19 +6,22 @@
 LLM 配置从全局配置读取。
 """
 
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from synth_engine.core.pipeline import SynthesisPipeline
 from synth_engine.core.config import SynthConfigModel
 from synth_engine.core.models import RunStatus
+from synth_engine.limits import LIMITS
 from synth_engine import templates  # noqa: F401 (触发模板自动注册)
+from synth_engine.task_queue import task_queue
+from synth_engine.task_ids import generate_task_id
+from synth_engine.tenant import current_workspace
 from synth_engine.templates.registry import TemplateRegistry
 
 router = APIRouter()
@@ -28,25 +31,19 @@ import threading
 _synth_lock = threading.Lock()
 _active_runs: Dict[str, Dict] = {}  # run_id -> {"status": RunStatus, "start_time": str}
 
-# 模板目录由后端自动发现
-TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
-# 全局 LLM 配置路径
-LLM_CONFIG_PATH = Path(__file__).parent.parent.parent.parent / "configs" / "llm_config.yaml"
-
-
-def _load_llm_configs() -> List[Dict]:
+def _load_llm_configs(config_path: Path) -> List[Dict]:
     """从全局配置加载 LLM 配置"""
-    if LLM_CONFIG_PATH.exists():
-        with open(LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
             if isinstance(cfg, list):
                 return cfg
     return []
 
 
-def _get_template_dir(template_name: str) -> Path:
+def _get_template_dir(templates_dir: Path, template_name: str) -> Path:
     """自动定位模板目录"""
-    tmpl_dir = TEMPLATES_DIR / template_name
+    tmpl_dir = templates_dir / template_name
     if not tmpl_dir.exists():
         raise HTTPException(status_code=404, detail=f"模板 '{template_name}' 不存在")
     return tmpl_dir
@@ -59,8 +56,16 @@ def _now_str() -> str:
 
 class SynthesisRequest(BaseModel):
     template_name: str
-    num_samples: int = 100
-    para: int = 3
+    num_samples: int = Field(
+        default=LIMITS.task_items.synthesis,
+        ge=1,
+        le=LIMITS.task_items.synthesis,
+    )
+    para: int = Field(
+        default=LIMITS.model_parallelism.default,
+        ge=1,
+        le=LIMITS.model_parallelism.max,
+    )
     synth_config_override: Optional[Dict] = None
 
 
@@ -82,19 +87,20 @@ def _set_run_status(run_id: str, status: RunStatus):
 @router.post("/start", response_model=SynthesisResponse)
 async def start_synthesis(req: SynthesisRequest):
     """启动合成任务"""
+    ws = current_workspace()
     if not TemplateRegistry.has(req.template_name):
         raise HTTPException(status_code=404, detail=f"模板 '{req.template_name}' 不存在")
 
-    llm_configs = _load_llm_configs()
+    llm_configs = _load_llm_configs(ws.configs_dir / "llm_config.yaml")
     if not llm_configs:
         raise HTTPException(
             status_code=400,
             detail="未配置 LLM。请先在「配置管理」页面设置 LLM API 地址和密钥。",
         )
 
-    template_dir = _get_template_dir(req.template_name)
-    run_id = str(uuid.uuid4())[:8]
-    run_dir = Path(__file__).parent.parent.parent.parent / "runs" / "outputs" / run_id
+    template_dir = _get_template_dir(ws.templates_dir, req.template_name)
+    run_id = generate_task_id(ws.username, "synth")
+    run_dir = ws.runs_dir / "outputs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 解析配置覆盖
@@ -103,8 +109,10 @@ async def start_synthesis(req: SynthesisRequest):
         synth_config = SynthConfigModel(**req.synth_config_override)
 
     _active_runs[run_id] = {
-        "status": RunStatus(run_id=run_id, stage="starting", message="任务已提交，等待处理..."),
+        "status": RunStatus(run_id=run_id, stage="queued", message="任务已提交，等待处理..."),
         "start_time": _now_str(),
+        "workspace_id": ws.workspace_id,
+        "username": ws.username,
     }
 
     import threading
@@ -136,16 +144,40 @@ async def start_synthesis(req: SynthesisRequest):
                 run_id=run_id, stage="error",
                 error=str(e), message=f"失败: {str(e)}",
             ))
+            raise
 
-    threading.Thread(target=run_pipeline, daemon=True).start()
+    def on_start():
+        _set_run_status(run_id, RunStatus(
+            run_id=run_id, stage="starting", total=req.num_samples, current=0,
+            message="任务已出队，正在启动...",
+        ))
 
-    return SynthesisResponse(run_id=run_id, status="starting", message="任务已提交")
+    queue_info = task_queue.submit(
+        job_id=run_id,
+        username=ws.username,
+        workspace_id=ws.workspace_id,
+        task_type="synthesis",
+        function=run_pipeline,
+        on_start=on_start,
+    )
+    position = queue_info.get("queue_position", 0)
+    if queue_info.get("state") == "queued":
+        _set_run_status(run_id, RunStatus(
+            run_id=run_id, stage="queued", total=req.num_samples, current=0,
+            message=f"任务已排队，当前排队位置 {position}",
+        ))
+
+    return SynthesisResponse(run_id=run_id, status="queued", message=f"任务已提交，排队位置 {position}")
 
 
 @router.get("/status/{run_id}")
 async def get_synthesis_status(run_id: str):
     """获取合成任务状态"""
-    runs_dir = Path(__file__).parent.parent.parent.parent / "runs" / "outputs"
+    ws = current_workspace()
+    runs_dir = ws.runs_dir / "outputs"
+
+    if run_id in _active_runs and _active_runs[run_id].get("workspace_id") != ws.workspace_id:
+        raise HTTPException(status_code=404, detail=f"运行 ID {run_id} 不存在")
 
     if run_id not in _active_runs:
         # 内存中没有，尝试从磁盘恢复状态
@@ -180,7 +212,7 @@ async def get_synthesis_status(run_id: str):
     start_time = entry.get("start_time", "")
 
     # 磁盘状态恢复：只对非运行中的任务生效
-    running_stages = {"starting", "initialized", "generating", "calling_llm", "filtering", "exporting"}
+    running_stages = {"queued", "starting", "initialized", "generating", "calling_llm", "filtering", "exporting"}
     if status.stage not in running_stages and status.stage not in ("done", "error") and (runs_dir / run_id).exists():
         if (runs_dir / run_id / "data.csv").exists():
             status.stage = "done"
@@ -191,7 +223,7 @@ async def get_synthesis_status(run_id: str):
             status.current = 0
             status.message = "任务被中断"
 
-    return {
+    result = {
         "run_id": status.run_id,
         "stage": status.stage,
         "total": status.total,
@@ -201,6 +233,17 @@ async def get_synthesis_status(run_id: str):
         "error": status.error,
         "start_time": start_time,
     }
+    queue_info = task_queue.status(run_id)
+    if queue_info:
+        result.update({
+            "queue_position": queue_info.get("queue_position", 0),
+            "queued_count": queue_info.get("queued_count", 0),
+            "running_count": queue_info.get("running_count", 0),
+            "max_concurrent": queue_info.get("max_concurrent", LIMITS.max_concurrent_tasks),
+        })
+        if status.stage == "queued":
+            result["message"] = f"排队中，当前位置 {queue_info.get('queue_position', 0)}，全局等待 {queue_info.get('queued_count', 0)} 个"
+    return result
 
 
 def _get_dir_mtime(dir_path: Path) -> str:
@@ -216,14 +259,17 @@ def _get_dir_mtime(dir_path: Path) -> str:
 @router.get("/list")
 async def list_synthesis_runs():
     """列出所有合成任务"""
-    runs_dir = Path(__file__).parent.parent.parent.parent / "runs" / "outputs"
+    ws = current_workspace()
+    runs_dir = ws.runs_dir / "outputs"
 
     runs = []
     seen_ids = set()
 
     # 从内存获取活跃任务
-    running_stages = {"starting", "initialized", "generating", "calling_llm", "filtering", "exporting"}
+    running_stages = {"queued", "starting", "initialized", "generating", "calling_llm", "filtering", "exporting"}
     for run_id, entry in _active_runs.items():
+        if entry.get("workspace_id") != ws.workspace_id:
+            continue
         s = entry["status"]
         start_time = entry.get("start_time", "")
         run_dir = runs_dir / run_id
@@ -248,14 +294,19 @@ async def list_synthesis_runs():
             progress = s.progress
             message = s.message
 
-        runs.append({
+        item = {
             "run_id": run_id,
             "stage": stage,
             "progress": progress,
             "message": message,
             "has_files": has_output,
             "start_time": start_time,
-        })
+        }
+        queue_info = task_queue.status(run_id)
+        if queue_info:
+            item["queue_position"] = queue_info.get("queue_position", 0)
+            item["queued_count"] = queue_info.get("queued_count", 0)
+        runs.append(item)
         seen_ids.add(run_id)
 
     # 扫描磁盘上已有但未在内存中的运行目录

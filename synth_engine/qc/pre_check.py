@@ -15,6 +15,7 @@ import pandas as pd
 from synth_engine.core.models import RunStatus
 from synth_engine.llm.parallel import run_llm_para
 from synth_engine.llm.embedding import get_embedding, compute_cosine_similarity_matrix
+from synth_engine.limits import LIMITS
 
 
 MENU_QUALITY_PROMPT = """你是一位专业的银行菜单定义质检专家。请对以下菜单定义进行质量检查。
@@ -89,9 +90,10 @@ def pre_synthesis_qc(
     intent_file: str,
     llm_configs: List[Dict],
     save_dir: str,
-    para: int = 3,
+    para: int = LIMITS.model_parallelism.default,
     embedding_config: Optional[Dict] = None,
     similarity_threshold: float = 0.90,
+    max_items: int = 20,
     status_callback: Optional[Callable[[RunStatus], None]] = None,
 ) -> Dict[str, str]:
     """
@@ -114,6 +116,7 @@ def pre_synthesis_qc(
                 "sub_intent_name": sub.get("name", ""),
                 "description": sub.get("description", ""),
             })
+    menu_items = menu_items[:max(1, min(max_items, 20))]
 
     results = {}
 
@@ -194,7 +197,7 @@ def pre_synthesis_qc(
         for i, item in enumerate(menu_items):
             emb = get_embedding(item["description"], base_url=base_url, api_key=api_key, model=model)
             embeddings.append(emb)
-            if status_callback and (i + 1) % 10 == 0:
+            if status_callback:
                 status_callback(RunStatus(run_id="", stage="similarity_check", total=len(menu_items), current=i + 1, message=f"正在检测相似菜单... ({i + 1}/{len(menu_items)})"))
 
         sim_matrix = compute_cosine_similarity_matrix(embeddings)
@@ -219,7 +222,22 @@ def pre_synthesis_qc(
                 sim_queries.append(prompt)
                 sim_info.append((a, b, score))
 
-            df_sim = run_llm_para(sim_queries, para, llm_configs)
+            if status_callback:
+                status_callback(RunStatus(
+                    run_id="", stage="similarity_check", total=len(sim_queries), current=0,
+                    message=f"正在判断相似菜单... (0/{len(sim_queries)})",
+                ))
+            df_sim = run_llm_para(
+                sim_queries,
+                para,
+                llm_configs,
+                progress_callback=lambda done, total: status_callback(
+                    RunStatus(
+                        run_id="", stage="similarity_check", total=total, current=done,
+                        message=f"正在判断相似菜单... ({done}/{total})",
+                    )
+                ) if status_callback else None,
+            )
             if df_sim is not None:
                 sim_records = []
                 for idx, (_, row) in enumerate(df_sim.iterrows()):

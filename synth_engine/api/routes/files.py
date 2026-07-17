@@ -13,11 +13,9 @@ from typing import Any, Dict, List
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
+from synth_engine.tenant import current_workspace
 
 router = APIRouter()
-
-RUNS_DIR = Path(__file__).parent.parent.parent.parent / "runs"
-
 
 def _dir_mtime(dir_path: Path) -> str:
     """获取目录的修改时间字符串"""
@@ -45,8 +43,9 @@ def _sanitize(obj: Any) -> Any:
 async def list_all_runs():
     """列出所有运行结果（自动扫描磁盘）"""
     runs = []
-    outputs_dir = RUNS_DIR / "outputs"
-    qc_dir = RUNS_DIR / "qc_results"
+    runs_dir = current_workspace().runs_dir
+    outputs_dir = runs_dir / "outputs"
+    qc_dir = runs_dir / "qc_results"
 
     for search_dir in [outputs_dir, qc_dir]:
         if search_dir.exists():
@@ -63,7 +62,7 @@ async def list_all_runs():
                     runs.append({
                         "run_id": d.name,
                         "files": files,
-                        "dir": str(d.relative_to(RUNS_DIR)),
+                        "dir": str(d.relative_to(runs_dir)),
                         "mtime": _dir_mtime(d),
                     })
 
@@ -73,9 +72,11 @@ async def list_all_runs():
 @router.delete("/runs/{run_id}")
 async def delete_run(run_id: str):
     """删除运行结果目录"""
+    runs_dir = current_workspace().runs_dir
+    safe_run_id = Path(run_id).name
     import shutil
     for search_dir in ["outputs", "qc_results"]:
-        d = RUNS_DIR / search_dir / run_id
+        d = runs_dir / search_dir / safe_run_id
         if d.exists():
             shutil.rmtree(str(d))
             return {"status": "ok", "message": f"已删除 {run_id}"}
@@ -85,9 +86,12 @@ async def delete_run(run_id: str):
 @router.get("/download/{run_id}/{filename}")
 async def download_file(run_id: str, filename: str):
     """下载运行结果文件"""
-    file_path = RUNS_DIR / "outputs" / run_id / filename
+    runs_dir = current_workspace().runs_dir
+    safe_run_id = Path(run_id).name
+    safe_filename = Path(filename).name
+    file_path = runs_dir / "outputs" / safe_run_id / safe_filename
     if not file_path.exists():
-        file_path = RUNS_DIR / "qc_results" / run_id / filename
+        file_path = runs_dir / "qc_results" / safe_run_id / safe_filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"文件不存在: {run_id}/{filename}")
 
@@ -101,9 +105,12 @@ async def download_file(run_id: str, filename: str):
 @router.get("/preview/{run_id}/{filename}")
 async def preview_file(run_id: str, filename: str, limit: int = 50):
     """预览结果文件内容（CSV/JSONL 前 N 条）"""
-    file_path = RUNS_DIR / "outputs" / run_id / filename
+    runs_dir = current_workspace().runs_dir
+    safe_run_id = Path(run_id).name
+    safe_filename = Path(filename).name
+    file_path = runs_dir / "outputs" / safe_run_id / safe_filename
     if not file_path.exists():
-        file_path = RUNS_DIR / "qc_results" / run_id / filename
+        file_path = runs_dir / "qc_results" / safe_run_id / safe_filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"文件不存在: {run_id}/{filename}")
 

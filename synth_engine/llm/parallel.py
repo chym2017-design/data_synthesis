@@ -94,6 +94,7 @@ def run_llm_para(
 def run_llm_para_with_assign(
     queries: List[Tuple[str, Dict[str, Any]]],
     para: int,
+    progress_callback=None,
 ) -> Optional[pd.DataFrame]:
     """
     并行调用多个 LLM，每个 query 指定一个模型配置。
@@ -118,6 +119,8 @@ def run_llm_para_with_assign(
             out = future.result()
             out["idx"] = idx
             results.append(out)
+            if progress_callback:
+                progress_callback(len(results), len(queries))
 
     if not results:
         return None

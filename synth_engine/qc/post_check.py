@@ -15,6 +15,7 @@ import pandas as pd
 from synth_engine.core.models import RunStatus
 from synth_engine.llm.parallel import run_llm_para_with_assign
 from synth_engine.llm.embedding import get_embedding, compute_cosine_similarity_matrix, cosine_similarity
+from synth_engine.limits import LIMITS
 
 
 def build_intent_prompt(
@@ -165,11 +166,11 @@ def embedding_similarity_check(
         if emb is not None:
             embeddings[idx] = emb
             valid_indices.append(idx)
-        if status_callback and valid_indices:
+        if status_callback:
             status_callback(RunStatus(
                 run_id="", stage="embedding", total=len(df),
-                current=valid_indices[-1],
-                message=f"正在计算 Embedding... ({len(valid_indices)}/{len(df)})",
+                current=idx + 1,
+                message=f"正在计算 Embedding... ({idx + 1}/{len(df)}，成功 {len(valid_indices)})",
             ))
 
     pairs = []
@@ -215,7 +216,7 @@ def llm_qc_with_voting(
     intent_config: Dict,
     llm_configs: List[Dict],
     save_dir: str,
-    para: int = 3,
+    para: int = LIMITS.model_parallelism.default,
     sample_size: Optional[int] = None,
     status_callback: Optional[Callable[[RunStatus], None]] = None,
 ) -> Dict[str, str]:
@@ -266,9 +267,18 @@ def llm_qc_with_voting(
             level1_metadata.append((si, mi))
 
     if status_callback:
-        status_callback(RunStatus(run_id="", stage="llm_qc", total=len(df) * 2, current=0, message="正在执行一级意图判定..."))
+        status_callback(RunStatus(run_id="", stage="llm_level1", total=len(level1_queries), current=0, message=f"正在执行一级意图判定... (0/{len(level1_queries)})"))
 
-    results1 = run_llm_para_with_assign(level1_queries, para=para)
+    results1 = run_llm_para_with_assign(
+        level1_queries,
+        para=para,
+        progress_callback=lambda done, total: status_callback(
+            RunStatus(
+                run_id="", stage="llm_level1", total=total, current=done,
+                message=f"正在执行一级意图判定... ({done}/{total})",
+            )
+        ) if status_callback else None,
+    )
 
     sample_model_results = {}
     level2_queries = []
@@ -298,17 +308,20 @@ def llm_qc_with_voting(
             level2_queries.append((prompt2, llm_configs[mi]))
             level2_metadata.append((si, mi))
 
-        if status_callback:
-            status_callback(RunStatus(
-                run_id="", stage="llm_qc", total=len(df) * 2,
-                current=i + 1, message=f"正在执行一级意图判定... ({i + 1}/{len(level1_metadata)})",
-            ))
-
     if level2_queries:
         if status_callback:
-            status_callback(RunStatus(run_id="", stage="llm_qc", total=len(df) * 2, current=len(level1_metadata), message="正在执行二级意图判定..."))
+            status_callback(RunStatus(run_id="", stage="llm_level2", total=len(level2_queries), current=0, message=f"正在执行二级意图判定... (0/{len(level2_queries)})"))
 
-        results2 = run_llm_para_with_assign(level2_queries, para=para)
+        results2 = run_llm_para_with_assign(
+            level2_queries,
+            para=para,
+            progress_callback=lambda done, total: status_callback(
+                RunStatus(
+                    run_id="", stage="llm_level2", total=total, current=done,
+                    message=f"正在执行二级意图判定... ({done}/{total})",
+                )
+            ) if status_callback else None,
+        )
         if results2 is not None:
             for i, (si, mi) in enumerate(level2_metadata):
                 response = results2.iloc[i].get("response", "") if i < len(results2) else ""
@@ -319,14 +332,18 @@ def llm_qc_with_voting(
                 sample_model_results[key]["level2_correct"] = correct
                 sample_model_results[key]["true_level2"] = row["true_sub_intent"]
 
-                if status_callback:
-                    status_callback(RunStatus(
-                        run_id="", stage="llm_qc", total=len(df) * 2,
-                        current=len(level1_metadata) + i + 1,
-                        message=f"正在执行二级意图判定... ({i + 1}/{len(level2_metadata)})",
-                    ))
+    elif status_callback:
+        status_callback(RunStatus(
+            run_id="", stage="llm_level2", total=1, current=1,
+            message="一级意图均未通过，无需执行二级意图判定",
+        ))
 
     # 投票汇总
+    if status_callback:
+        status_callback(RunStatus(
+            run_id="", stage="llm_summary", total=len(df), current=0,
+            message=f"正在汇总模型投票... (0/{len(df)})",
+        ))
     summary_records = []
     detail_records = []
 
@@ -386,6 +403,11 @@ def llm_qc_with_voting(
                 else f"二级意图判定失败({l2_correct_count}/{total})"
             ),
         })
+        if status_callback:
+            status_callback(RunStatus(
+                run_id="", stage="llm_summary", total=len(df), current=si + 1,
+                message=f"正在汇总模型投票... ({si + 1}/{len(df)})",
+            ))
 
     detail_path = str(Path(save_dir) / "qc_detail_by_model.csv")
     summary_path = str(Path(save_dir) / "qc_summary_voting.csv")

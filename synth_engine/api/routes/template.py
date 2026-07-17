@@ -13,11 +13,9 @@ from pydantic import BaseModel
 
 from synth_engine import templates  # noqa: F401
 from synth_engine.templates.registry import TemplateRegistry
+from synth_engine.tenant import current_workspace
 
 router = APIRouter()
-
-TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
-
 
 class TemplateInfo(BaseModel):
     name: str
@@ -32,10 +30,11 @@ class TemplateInfo(BaseModel):
 async def list_templates():
     """列出所有模板"""
     templates = []
-    if not TEMPLATES_DIR.exists():
+    templates_dir = current_workspace().templates_dir
+    if not templates_dir.exists():
         return templates
 
-    for d in TEMPLATES_DIR.iterdir():
+    for d in templates_dir.iterdir():
         if d.is_dir() and not d.name.startswith("_"):
             files = [f.name for f in d.iterdir() if not f.name.startswith("_")]
             templates.append(TemplateInfo(
@@ -52,7 +51,7 @@ async def list_templates():
 @router.get("/{template_name}")
 async def get_template_info(template_name: str):
     """获取模板详情"""
-    tmpl_dir = TEMPLATES_DIR / template_name
+    tmpl_dir = current_workspace().templates_dir / Path(template_name).name
     if not tmpl_dir.exists():
         raise HTTPException(status_code=404, detail=f"模板不存在: {template_name}")
 
@@ -67,12 +66,16 @@ async def get_template_info(template_name: str):
 @router.post("/create")
 async def create_template(template_name: str, source: str = None):
     """创建新模板（可复制已有模板）"""
-    tmpl_dir = TEMPLATES_DIR / template_name
+    templates_dir = current_workspace().templates_dir
+    safe_name = Path(template_name).name
+    if safe_name != template_name or not safe_name:
+        raise HTTPException(status_code=400, detail="模板名称不合法")
+    tmpl_dir = templates_dir / safe_name
     if tmpl_dir.exists():
         raise HTTPException(status_code=400, detail=f"模板已存在: {template_name}")
 
     if source:
-        src_dir = TEMPLATES_DIR / source
+        src_dir = templates_dir / Path(source).name
         if not src_dir.exists():
             raise HTTPException(status_code=404, detail=f"源模板不存在: {source}")
         shutil.copytree(src_dir, tmpl_dir)
@@ -110,7 +113,7 @@ async def create_template(template_name: str, source: str = None):
 @router.delete("/{template_name}")
 async def delete_template(template_name: str):
     """删除模板"""
-    tmpl_dir = TEMPLATES_DIR / template_name
+    tmpl_dir = current_workspace().templates_dir / Path(template_name).name
     if not tmpl_dir.exists():
         raise HTTPException(status_code=404, detail=f"模板不存在: {template_name}")
     shutil.rmtree(tmpl_dir)
@@ -120,12 +123,13 @@ async def delete_template(template_name: str):
 @router.get("/{template_name}/prompt/{prompt_name}")
 async def get_prompt_template(template_name: str, prompt_name: str):
     """获取 Prompt 模板内容（支持 .md 后缀自动补全）"""
-    tmpl_dir = TEMPLATES_DIR / template_name
+    tmpl_dir = current_workspace().templates_dir / Path(template_name).name
     if not tmpl_dir.exists():
         raise HTTPException(status_code=404, detail=f"模板不存在: {template_name}")
 
     # 尝试不同后缀
-    candidates = [prompt_name, f"{prompt_name}.md"]
+    safe_prompt = Path(prompt_name).name
+    candidates = [safe_prompt, f"{safe_prompt}.md"]
     for name in candidates:
         p = tmpl_dir / "prompts" / name
         if p.exists():
